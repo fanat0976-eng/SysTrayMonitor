@@ -1,11 +1,9 @@
 """
 SysTray Monitor — иконка в трее с CPU/RAM/Disk + Ollama статус.
 """
-import asyncio
 import threading
 import time
 import sys
-from datetime import datetime
 
 import psutil
 import httpx
@@ -15,7 +13,11 @@ from PIL import Image, ImageDraw, ImageFont
 
 # ── Config ─────────────────────────────────────────────
 OLLAMA_URL = "http://127.0.0.1:11434"
-UPDATE_INTERVAL = 3  # seconds
+UPDATE_INTERVAL = 3
+
+# Shared state
+_metrics = {}
+_lock = threading.Lock()
 
 
 # ── System metrics ─────────────────────────────────────
@@ -49,22 +51,19 @@ def get_metrics():
 
 
 # ── Icon generation ────────────────────────────────────
-def create_icon(cpu_pct, ram_pct, ollama_ok):
-    """Create a small tray icon with status color."""
+def create_icon(cpu_pct, ollama_ok):
     img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
 
-    # Background circle — color by CPU load
     if cpu_pct > 80:
-        color = (220, 50, 50)  # red
+        color = (220, 50, 50)
     elif cpu_pct > 50:
-        color = (220, 160, 30)  # yellow
+        color = (220, 160, 30)
     else:
-        color = (50, 180, 80)  # green
+        color = (50, 180, 80)
 
     draw.ellipse([4, 4, 60, 60], fill=color)
 
-    # CPU number
     text = f"{int(cpu_pct)}"
     try:
         font = ImageFont.truetype("arial.ttf", 22)
@@ -75,82 +74,86 @@ def create_icon(cpu_pct, ram_pct, ollama_ok):
     tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
     draw.text(((64 - tw) / 2, (64 - th) / 2 - 2), text, fill="white", font=font)
 
-    # Ollama dot
     dot_color = (0, 200, 0) if ollama_ok else (100, 100, 100)
     draw.ellipse([48, 2, 60, 14], fill=dot_color)
 
     return img
 
 
-# ── Tooltip ────────────────────────────────────────────
-def make_tooltip(m):
-    return (
-        f"CPU: {m['cpu']:.0f}%\n"
-        f"RAM: {m['ram_used']}MB / {m['ram_total']}MB ({m['ram_pct']:.0f}%)\n"
-        f"Disk C:: {m['disk_free']}GB free / {m['disk_total']}GB\n"
-        f"Ollama: {m['ollama']} ({m['ollama_models']} models)"
-    )
+# ── Dynamic menu ───────────────────────────────────────
+def make_menu():
+    """Build menu with current metrics."""
+    with _lock:
+        m = _metrics.copy()
 
-
-# ── Menu ───────────────────────────────────────────────
-def make_menu(m):
-    return pystray.Menu(
-        pystray.MenuItem(f"CPU: {m['cpu']:.0f}%", None, enabled=False),
-        pystray.MenuItem(f"RAM: {m['ram_used']}MB / {m['ram_total']}MB ({m['ram_pct']:.0f}%)", None, enabled=False),
-        pystray.MenuItem(f"Disk: {m['disk_free']}GB free ({m['disk_pct']:.0f}%)", None, enabled=False),
-        pystray.MenuItem(f"Ollama: {m['ollama']} ({m['ollama_models']} models)", None, enabled=False),
-        pystray.Menu.SEPARATOR,
-        pystray.MenuItem("Refresh", lambda: None),
-        pystray.Menu.SEPARATOR,
-        pystray.MenuItem("Exit", lambda icon, item: icon.stop()),
-    )
-
-
-# ── Main loop ──────────────────────────────────────────
-class TrayMonitor:
-    def __init__(self):
-        self.icon = None
-        self.running = True
-
-    def update(self):
-        while self.running:
-            try:
-                m = get_metrics()
-                img = create_icon(m["cpu"], m["ram_pct"], m["ollama"] == "ON")
-                tooltip = make_tooltip(m)
-                menu = make_menu(m)
-
-                if self.icon:
-                    self.icon.icon = img
-                    self.icon.title = tooltip
-                    self.icon.menu = menu
-            except Exception as e:
-                print(f"Update error: {e}")
-            time.sleep(UPDATE_INTERVAL)
-
-    def run(self):
-        m = get_metrics()
-        img = create_icon(m["cpu"], m["ram_pct"], m["ollama"] == "ON")
-
-        self.icon = pystray.Icon(
-            "SysTrayMonitor",
-            icon=img,
-            title="SysTray Monitor",
-            menu=make_menu(m),
+    if not m:
+        return pystray.Menu(
+            pystray.MenuItem("Loading...", None, enabled=False),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("Exit", lambda i, i2: i.stop()),
         )
 
-        # Background updater
-        t = threading.Thread(target=self.update, daemon=True)
-        t.start()
+    return pystray.Menu(
+        pystray.MenuItem(f"CPU:  {m.get('cpu', 0):.0f}%", None, enabled=False),
+        pystray.MenuItem(f"RAM:  {m.get('ram_used', 0)} / {m.get('ram_total', 0)} MB ({m.get('ram_pct', 0):.0f}%)", None, enabled=False),
+        pystray.MenuItem(f"Disk: {m.get('disk_free', 0)} GB free ({m.get('disk_pct', 0):.0f}%)", None, enabled=False),
+        pystray.MenuItem(f"Ollama: {m.get('ollama', '?')} ({m.get('ollama_models', 0)} models)", None, enabled=False),
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem("Refresh", lambda i, i2: update_now()),
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem("Exit", lambda i, i2: i.stop()),
+    )
 
-        # Run tray (blocking)
-        self.icon.run()
+
+def update_now():
+    """Force immediate metrics update."""
+    global _metrics
+    m = get_metrics()
+    with _lock:
+        _metrics = m
+
+
+# ── Background updater ─────────────────────────────────
+def updater(icon):
+    """Background thread that updates icon + shared state."""
+    while True:
+        try:
+            m = get_metrics()
+            with _lock:
+                global _metrics
+                _metrics = m
+
+            icon.icon = create_icon(m["cpu"], m["ollama"] == "ON")
+            icon.title = f"CPU {m['cpu']:.0f}% | RAM {m['ram_pct']:.0f}% | Ollama {m['ollama']}"
+            icon.menu = make_menu()
+        except Exception as e:
+            print(f"Update error: {e}")
+        time.sleep(UPDATE_INTERVAL)
+
+
+# ── Main ───────────────────────────────────────────────
+def main():
+    m = get_metrics()
+    with _lock:
+        global _metrics
+        _metrics = m
+
+    icon = pystray.Icon(
+        "SysTrayMonitor",
+        icon=create_icon(m["cpu"], m["ollama"] == "ON"),
+        title=f"CPU {m['cpu']:.0f}% | RAM {m['ram_pct']:.0f}% | Ollama {m['ollama']}",
+        menu=make_menu(),
+    )
+
+    # Start background updater
+    t = threading.Thread(target=updater, args=(icon,), daemon=True)
+    t.start()
+
+    icon.run()
 
 
 if __name__ == "__main__":
-    monitor = TrayMonitor()
     try:
-        monitor.run()
+        main()
     except KeyboardInterrupt:
-        monitor.running = False
         sys.exit(0)
